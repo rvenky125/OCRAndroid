@@ -2,50 +2,51 @@ package com.example.characterrecognition
 
 import android.annotation.SuppressLint
 import android.graphics.*
-import android.util.Base64
+import android.media.Image
 import android.util.Log
 import androidx.camera.core.ImageAnalysis
 import androidx.camera.core.ImageProxy
 import androidx.camera.view.PreviewView
 import com.googlecode.tesseract.android.TessBaseAPI
-import kotlinx.coroutines.CoroutineScope
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.launch
-import kotlinx.coroutines.withContext
+import com.googlecode.tesseract.android.TessBaseAPI.PageIteratorLevel.RIL_PARA
+import com.googlecode.tesseract.android.TessBaseAPI.PageIteratorLevel.RIL_TEXTLINE
 import org.opencv.android.Utils
-import org.opencv.core.CvException
-import org.opencv.core.CvType
-import org.opencv.core.Mat
-import org.opencv.imgproc.Imgproc
+import org.opencv.core.*
+import org.opencv.core.Core.rotate
+import org.opencv.core.Point
 import org.opencv.imgproc.Imgproc.*
-import java.io.ByteArrayOutputStream
 import java.nio.ByteBuffer
 
 
 class OCRAnalyzer(
     private val tess: TessBaseAPI,
-    private val previewView: PreviewView,
-    private val onTextDetected: (String) -> Unit,
+    private val onTextDetected: (String, Bitmap?) -> Unit
 ) : ImageAnalysis.Analyzer {
     @SuppressLint("UnsafeOptInUsageError")
     override fun analyze(image: ImageProxy) {
-        CoroutineScope(Dispatchers.Unconfined).launch {
-//            val bytes = image.planes.first().buffer.toByteArray()
-//            Log.d("myTag", "bitmap length: ${bytes.size}")
-            try {
-//                val bitmap = image.toBitmap()
-                val bitmap = image.toMat().toBitMap()
-//                val bitmap = previewView.bitmap
-                tess.setImage(bitmap)
-                tess.getHOCRText(0)
-//                Log.d("myTag", tess.utF8Text)
-                onTextDetected(tess.utF8Text)
-            } catch (e: Exception) {
-                Log.d("myTag", "Failed to read text", e)
-            } finally {
-                image.close()
+        try {
+//            val bitmap = image.toMat().toBitMap()?.rotate(image.imageInfo.rotationDegrees)
+            val bitmap = BitmapUtils.getBitmap(image)
+            tess.clear()
+            tess.setImage(bitmap)
+//            tess.getHOCRText(0)
+            if (tess.meanConfidence() > 30) {
+                onTextDetected(tess.resultIterator.getUTF8Text(RIL_PARA), null)
             }
+//            bitmap?.recycle()
+        } catch (e: Exception) {
+            Log.d("myTag", "Failed to read text", e)
+        } finally {
+            image.close()
         }
+    }
+
+    fun Image.toBitmap(): Bitmap {
+        val buffer = planes[0].buffer
+        buffer.rewind()
+        val bytes = ByteArray(buffer.capacity())
+        buffer.get(bytes)
+        return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
     }
 
     private fun Mat.toBitMap(): Bitmap? {
@@ -58,7 +59,7 @@ class OCRAnalyzer(
         } catch (e: CvException) {
             Log.d("Exception", e.message!!)
         }
-        return bmp?.toThresholdBitmap()
+        return bmp
     }
 
     private fun ImageProxy.toMat(): Mat {
@@ -68,6 +69,7 @@ class OCRAnalyzer(
         val yPlane = ByteArray(ySize)
         yBuffer[yPlane, 0, ySize]
         graySourceMatrix.put(0, 0, yPlane)
+        rotate(graySourceMatrix, graySourceMatrix, imageInfo.rotationDegrees)
         return graySourceMatrix
     }
 
@@ -77,145 +79,6 @@ class OCRAnalyzer(
             get(it)
         }
     }
-
-    private suspend fun ImageProxy.toBitmap(): Bitmap? {
-        val nv21 = yuv420888ToNv21(this)
-        val yuvImage = YuvImage(nv21, ImageFormat.NV21, width, height, null)
-        return yuvImage.toBitmap()
-    }
-
-    private suspend fun YuvImage.toBitmap(): Bitmap? {
-        return withContext(Dispatchers.IO) {
-            val out = ByteArrayOutputStream()
-            if (!compressToJpeg(Rect(0, 0, width, height), 100, out))
-                return@withContext null
-            val imageBytes: ByteArray = out.toByteArray()
-            return@withContext BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
-        }
-    }
-
-    private suspend fun yuv420888ToNv21(image: ImageProxy): ByteArray {
-        val pixelCount = image.cropRect.width() * image.cropRect.height()
-        val pixelSizeBits = ImageFormat.getBitsPerPixel(ImageFormat.YUV_420_888)
-        val outputBuffer = ByteArray(pixelCount * pixelSizeBits / 8)
-        imageToByteBuffer(image, outputBuffer, pixelCount)
-        return outputBuffer
-    }
-
-    private suspend fun imageToByteBuffer(image: ImageProxy, outputBuffer: ByteArray, pixelCount: Int) {
-        assert(image.format == ImageFormat.YUV_420_888)
-
-        val imageCrop = image.cropRect
-        val imagePlanes = image.planes
-
-        imagePlanes.forEachIndexed { planeIndex, plane ->
-            // How many values are read in input for each output value written
-            // Only the Y plane has a value for every pixel, U and V have half the resolution i.e.
-            //
-            // Y Plane            U Plane    V Plane
-            // ===============    =======    =======
-            // Y Y Y Y Y Y Y Y    U U U U    V V V V
-            // Y Y Y Y Y Y Y Y    U U U U    V V V V
-            // Y Y Y Y Y Y Y Y    U U U U    V V V V
-            // Y Y Y Y Y Y Y Y    U U U U    V V V V
-            // Y Y Y Y Y Y Y Y
-            // Y Y Y Y Y Y Y Y
-            // Y Y Y Y Y Y Y Y
-            val outputStride: Int
-
-            // The index in the output buffer the next value will be written at
-            // For Y it's zero, for U and V we start at the end of Y and interleave them i.e.
-            //
-            // First chunk        Second chunk
-            // ===============    ===============
-            // Y Y Y Y Y Y Y Y    V U V U V U V U
-            // Y Y Y Y Y Y Y Y    V U V U V U V U
-            // Y Y Y Y Y Y Y Y    V U V U V U V U
-            // Y Y Y Y Y Y Y Y    V U V U V U V U
-            // Y Y Y Y Y Y Y Y
-            // Y Y Y Y Y Y Y Y
-            // Y Y Y Y Y Y Y Y
-            var outputOffset: Int
-
-            when (planeIndex) {
-                0 -> {
-                    outputStride = 1
-                    outputOffset = 0
-                }
-                1 -> {
-                    outputStride = 2
-                    // For NV21 format, U is in odd-numbered indices
-                    outputOffset = pixelCount + 1
-                }
-                2 -> {
-                    outputStride = 2
-                    // For NV21 format, V is in even-numbered indices
-                    outputOffset = pixelCount
-                }
-                else -> {
-                    // Image contains more than 3 planes, something strange is going on
-                    return@forEachIndexed
-                }
-            }
-
-            val planeBuffer = plane.buffer
-            val rowStride = plane.rowStride
-            val pixelStride = plane.pixelStride
-
-            // We have to divide the width and height by two if it's not the Y plane
-            val planeCrop = if (planeIndex == 0) {
-                imageCrop
-            } else {
-                Rect(
-                    imageCrop.left / 2,
-                    imageCrop.top / 2,
-                    imageCrop.right / 2,
-                    imageCrop.bottom / 2
-                )
-            }
-
-            val planeWidth = planeCrop.width()
-            val planeHeight = planeCrop.height()
-
-            // Intermediate buffer used to store the bytes of each row
-            val rowBuffer = ByteArray(plane.rowStride)
-
-            // Size of each row in bytes
-            val rowLength = if (pixelStride == 1 && outputStride == 1) {
-                planeWidth
-            } else {
-                // Take into account that the stride may include data from pixels other than this
-                // particular plane and row, and that could be between pixels and not after every
-                // pixel:
-                //
-                // |---- Pixel stride ----|                    Row ends here --> |
-                // | Pixel 1 | Other Data | Pixel 2 | Other Data | ... | Pixel N |
-                //
-                // We need to get (N-1) * (pixel stride bytes) per row + 1 byte for the last pixel
-                (planeWidth - 1) * pixelStride + 1
-            }
-
-            for (row in 0 until planeHeight) {
-                // Move buffer position to the beginning of this row
-                planeBuffer.position(
-                    (row + planeCrop.top) * rowStride + planeCrop.left * pixelStride)
-
-                if (pixelStride == 1 && outputStride == 1) {
-                    // When there is a single stride value for pixel and output, we can just copy
-                    // the entire row in a single step
-                    planeBuffer.get(outputBuffer, outputOffset, rowLength)
-                    outputOffset += rowLength
-                } else {
-                    // When either pixel or output have a stride > 1 we must copy pixel by pixel
-                    planeBuffer.get(rowBuffer, 0, rowLength)
-                    for (col in 0 until planeWidth) {
-                        outputBuffer[outputOffset] = rowBuffer[col * pixelStride]
-                        outputOffset += outputStride
-                    }
-                }
-            }
-        }
-    }
 }
 
 
@@ -223,7 +86,98 @@ fun Bitmap.toThresholdBitmap(): Bitmap {
     val imageMat = Mat()
     Utils.bitmapToMat(this, imageMat)
     cvtColor(imageMat, imageMat, COLOR_BGR2GRAY)
-    adaptiveThreshold(imageMat, imageMat, 255.0, ADAPTIVE_THRESH_GAUSSIAN_C, THRESH_BINARY,29, 10.0)
+    adaptiveThreshold(
+        imageMat,
+        imageMat,
+        255.0,
+        ADAPTIVE_THRESH_GAUSSIAN_C,
+        THRESH_BINARY,
+        29,
+        10.0
+    )
     Utils.matToBitmap(imageMat, this)
     return this
+}
+
+fun Bitmap.rotate(angle: Int): Bitmap {
+    val matrix = Matrix().apply { postRotate(angle.toFloat()) }
+    return Bitmap.createBitmap(this, 0, 0, width, height, matrix, true)
+}
+
+
+//this funtcion will correct image.
+fun deskew(src: Mat, angle: Double): Mat {
+    val center = Point((src.width() / 2).toDouble(), (src.height() / 2).toDouble())
+    val rotImage = getRotationMatrix2D(center, angle, 1.0)
+    //1.0 means 100 % scale
+    val size = Size(src.width().toDouble(), src.height().toDouble())
+    //Imgproc.warpAffine(src, src, rotImage, size, Imgproc.INTER_LINEAR + Imgproc.CV_WARP_FILL_OUTLIERS);
+    warpAffine(
+        src,
+        src,
+        rotImage,
+        size,
+        INTER_LINEAR + CV_WARP_FILL_OUTLIERS,
+        0,
+        Scalar(255.0, 255.0, 255.0)
+    )
+    return src
+}
+
+fun Bitmap.deskew(): Bitmap {
+    val imgMat = Mat()
+    Utils.bitmapToMat(this, imgMat)
+
+    //convert image into grayscale
+    cvtColor(imgMat, imgMat, COLOR_BGR2GRAY)
+
+
+    //Barbarize it
+    //Use adaptive threshold if necessary
+    // Imgproc.adaptiveThreshold(img, img, 255, ADAPTIVE_THRESH_MEAN_C, THRESH_BINARY, 15, 40);
+    threshold(imgMat, imgMat, 200.0, 255.0, THRESH_BINARY)
+
+    //Invert the colors (because objects are represented as white pixels, and the background is represented by black pixels)
+    Core.bitwise_not(imgMat, imgMat)
+    val element = getStructuringElement(MORPH_RECT, Size(3.0, 3.0))
+
+    //We can now perform our erosion, we must declare our rectangle-shaped structuring element and call the erode function
+    erode(imgMat, imgMat, element)
+
+    //Find all white pixels
+    val wLocMat: Mat = Mat.zeros(imgMat.size(), imgMat.type())
+    Core.findNonZero(imgMat, wLocMat)
+
+    //Create an empty Mat and pass it to the function
+    val matOfPoint = MatOfPoint(wLocMat)
+
+    //Translate MatOfPoint to MatOfPoint2f in order to user at a next step
+    val mat2f = MatOfPoint2f()
+    matOfPoint.convertTo(mat2f, CvType.CV_32FC2)
+
+    //Get rotated rect of white pixels
+    val rotatedRect = minAreaRect(mat2f)
+    val vertices: Array<Point?> = arrayOfNulls<Point>(4)
+    rotatedRect.points(vertices)
+    val boxContours: MutableList<MatOfPoint> = ArrayList()
+    boxContours.add(MatOfPoint(*vertices))
+    drawContours(imgMat, boxContours, 0, Scalar(128.0, 128.0, 128.0), -1)
+    for (i in 0..3) line(
+        imgMat,
+        vertices[i], vertices[(i + 1) % 4], Scalar(255.0, 0.0, 0.0), 2
+    )
+//    if (rotatedRect.size.width > rotatedRect.size.height && resultAngle < -45f) {
+//        rotatedRect.angle += 90.0f
+//    } else if (rotatedRect.size.width < rotatedRect.size.height && resultAngle < -45f) {
+//        rotatedRect.angle = rotatedRect.angle + 90f
+//    }
+
+    //Or
+    val angle = if (rotatedRect.angle < -45) -(rotatedRect.angle + 90f) else -rotatedRect.angle
+
+    Utils.bitmapToMat(this, imgMat)
+    val result = deskew(imgMat, angle)
+    val bitmap = Bitmap.createBitmap(result.cols(), result.rows(), Bitmap.Config.ARGB_8888)
+    Utils.matToBitmap(result, bitmap)
+    return bitmap
 }
